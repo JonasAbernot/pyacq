@@ -192,7 +192,7 @@ class QTimeFreq(BaseSpectro):
                 if self.local_workers:
                     self.workers[i].compute_one_map(head)
                 else:
-                    self.workers[i].compute_one_map(head, _sync=False)
+                    self.workers[i].compute_one_map(head, _sync='off')
     
     def on_new_map_local(self, chan):
         head, wt_map = self.input_maps[chan].recv()
