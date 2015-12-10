@@ -172,48 +172,6 @@ class QTimeFreq(BaseSpectro):
                 self.plots[i].setYRange(f_start, f_stop)
                 self.images[i] =image
     
-    def on_param_change(self, params, changes):
-        for param, change, data in changes:
-            if change != 'value': continue
-            # immediate action
-            if param.name()=='background_color':
-                color = data
-                for graphicsview in self.graphicsviews:
-                    if graphicsview is not None:
-                        graphicsview.setBackground(color)
-            if param.name()=='refresh_interval':
-                self.global_timer.setInterval(data)
-            if param.name()=='clim':
-                i = self.by_channel_params.children().index(param.parent())
-                clim = param.value()
-                if self.images[i] is not None:
-                    self.images[i].setImage(self.images[i].image, lut=self.lut, levels=[0,clim])
-            if param.name()=='show_axis':
-                for plot in self.plots:
-                    if plot is not None:
-                        plot.showAxis('left', data)
-                        plot.showAxis('bottom', data)                        
-            
-            # difered action delayed with timer
-            with self.mutex_action:
-                if param.name()=='xsize':
-                    self.actions[self.initialize_freq_repr] = True
-                    self.actions[self.initialize_plots] = True
-                if param.name()=='colormap':
-                    self.actions[self.initialize_plots] = True
-                if param.name()=='nb_column':
-                    self.actions[self.create_grid] = True
-                    self.actions[self.initialize_plots] = True
-                if param.name() in ('f_start', 'f_stop', 'deltafreq', 'f0', 'normalisation'):
-                    self.actions[self.initialize_freq_repr] = True
-                    self.actions[self.initialize_plots] = True
-                if param.name()=='visible':
-                    self.actions[self.create_grid] = True
-                    self.actions[self.initialize_plots] = True
-        
-        with self.mutex_action:
-            if not self.timer_action.isActive() and any(self.actions.values()):
-                self.timer_action.start()
     
     def apply_actions(self):
         with self.mutex_action:
