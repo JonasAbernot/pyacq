@@ -23,224 +23,6 @@ except ImportError:
     HAVE_SCIPY = False
 
 
-default_params = [
-        {'name': 'xsize', 'type': 'float', 'value': 10., 'step': 0.1, 'limits': (.1, 60)},
-        {'name': 'nb_column', 'type': 'int', 'value': 1},
-        {'name': 'background_color', 'type': 'color', 'value': 'k'},
-        #~ {'name': 'colormap', 'type': 'list', 'value': 'hot', 'values' : ['hot', 'coolwarm', 'ice', 'grays', ] },
-        {'name': 'colormap', 'type': 'list', 'value': 'hot', 'values': list(vispy.color.get_colormaps().keys())},
-        {'name': 'refresh_interval', 'type': 'int', 'value': 500, 'limits':[5, 1000]},
-        {'name': 'mode', 'type': 'list', 'value': 'scroll', 'values': ['scan', 'scroll']},
-        {'name': 'show_axis', 'type': 'bool', 'value': False},
-        # ~ {'name': 'display_labels', 'type': 'bool', 'value': False }, #TODO when title
-        {'name': 'timefreq', 'type': 'group', 'children': [
-                        {'name': 'f_start', 'type': 'float', 'value': 3., 'step': 1.},
-                        {'name': 'f_stop', 'type': 'float', 'value': 90., 'step': 1.},
-                        {'name': 'deltafreq', 'type': 'float', 'value': 3., 'step': 1., 'limits': [0.1, 1.e6]},
-                        {'name': 'f0', 'type': 'float', 'value': 2.5, 'step': 0.1},
-                        {'name': 'normalisation', 'type': 'float', 'value': 0., 'step': 0.1},]}
-    ]
-
-default_by_channel_params = [ 
-                {'name': 'visible', 'type': 'bool', 'value': True},
-                {'name': 'clim', 'type': 'float', 'value': 1.},
-            ]
-
-
-class QTimeFreq(BaseSpectro):
-    """
-    Class for visualizing the frequency spectrogram with a Morlet continuous
-    wavelet transform.
-    
-    This allows better visualization than the standard FFT spectrogram because
-    it provides better temporal resolution for high-frequency signals without
-    sacrificing frequency resolution for low-frequency signals.
-    See https://en.wikipedia.org/wiki/Morlet_wavelet
-    
-    This class internally uses one TimeFreqWorker per channel, which allows
-    multiple signals to be transformed in parallel.
-        
-    The node operates in one of 2 modes:
-    
-    * Each TimeFreqWorker lives in the same QApplication as the QTimeFreq node
-      (nodegroup_friends=None).
-    * Each TimeFreqWorker is spawned in another NodeGroup to distribute the
-      load (nodegroup_friends=[some_list_of_nodegroup]).
-    
-    This viewer needs manual tuning for performance: small refresh_interval, 
-    high number of freqs, hight f_stop, and high xsize can all lead to heavy
-    CPU load.
-    
-    This node requires its input stream to use:
-    
-    * ``transfermode==sharedarray``
-    * ``timeaxis==1``
-    
-    If the input stream does not meet these requirements, then a StreamConverter
-    will be created to proxy the input.
-    
-    QTimeFreq can be configured on the fly by changing QTimeFreq.params and 
-    QTimeFreq.by_channel_params. By default, double-clicking on the viewer 
-    will open a GUI dialog for these parameters.
-    
-    
-    Usage::
-    
-        viewer = QTimeFreq()
-        viewer.configure(with_user_dialog=True, nodegroup_friends=None)
-        viewer.input.connect(somedevice.output)
-        viewer.initialize()
-        viewer.show()
-        viewer.start()
-        
-        viewer.params['nb_column'] = 4
-        viewer.params['refresh_interval'] = 1000
-    
-    """
-    
-    _input_specs = {'signal': dict(streamtype='signals', shape=(-1), )}
-    
-    _default_params = default_params
-    _default_by_channel_params = default_by_channel_params
-
-    def __init__(self, **kargs):
-        BaseSpectro.__init__(self, **kargs)
-        self.worker_cls = TimeFreqWorker
-        self.controller_cls = TimeFreqController
-
-    def _configure(self,max_xsize=60., **kargs):
-        BaseSpectro._configure(self,**kargs)
-        self.max_xsize = max_xsize
-    
-    def initialize_freq_repr(self):
-        tfr_params = self.params.param('timefreq')
-        
-        # we take sample_rate = f_stop*4 or (original sample_rate)
-        if tfr_params['f_stop']*4 < self.sample_rate:
-            sub_sample_rate = tfr_params['f_stop']*4
-        else:
-            sub_sample_rate = self.sample_rate
-        
-        # this try to find the best size to get a timefreq of 2**N by changing
-        # the sub_sample_rate and the sig_chunk_size
-        self.wanted_size = self.params['xsize']
-        self.len_wavelet = l = int(2**np.ceil(np.log(self.wanted_size*sub_sample_rate)/np.log(2)))
-        self.sig_chunk_size = self.wanted_size*self.sample_rate
-        self.downsample_factor = int(np.ceil(self.sig_chunk_size/l))
-        self.sig_chunk_size = self.downsample_factor*l
-        self.sub_sample_rate = self.sample_rate/self.downsample_factor
-        self.plot_length = int(self.wanted_size*sub_sample_rate)
-        
-        self.wavelet_fourrier = generate_wavelet_fourier(self.len_wavelet, tfr_params['f_start'], tfr_params['f_stop'],
-                            tfr_params['deltafreq'], self.sub_sample_rate, tfr_params['f0'], tfr_params['normalisation'])
-        
-        if self.downsample_factor>1:
-            self.filter_b = scipy.signal.firwin(9, 1. / self.downsample_factor, window='hamming')
-            self.filter_a = np.array([1.])
-        else:
-            self.filter_b = None
-            self.filter_a = None
-        
-        for worker in self.workers:
-            worker.on_fly_change_wavelet(wavelet_fourrier=self.wavelet_fourrier, downsample_factor=self.downsample_factor,
-                        sig_chunk_size=self.sig_chunk_size, plot_length=self.plot_length, filter_a=self.filter_a, filter_b=self.filter_b)
-        
-        for input_map in self.input_maps:
-            input_map.params['shape'] = (self.plot_length, self.wavelet_fourrier.shape[1])
-            input_map.params['sample_rate'] = sub_sample_rate
-    
-    def initialize_plots(self):
-        N = 512
-        cmap = vispy.color.get_colormap(self.params['colormap'])
-        self.lut = (255*cmap.map(np.arange(N)[:,None]/float(N))).astype('uint8')
-        
-        tfr_params = self.params.param('timefreq')
-        for i in range(self.nb_channel):
-            if self.by_channel_params.children()[i]['visible']:
-                for item in self.plots[i].items:
-                    # remove old images
-                    self.plots[i].removeItem(item)
-                
-                clim = self.by_channel_params.children()[i]['clim']
-                f_start, f_stop = tfr_params['f_start'], tfr_params['f_stop']
-                
-                image = pg.ImageItem()
-                image.setImage(np.zeros((self.plot_length,self.wavelet_fourrier.shape[1])), lut=self.lut, levels=[0,clim])
-                self.plots[i].addItem(image)
-                image.setRect(QtCore.QRectF(-self.wanted_size, f_start,self.wanted_size, f_stop-f_start))
-                self.plots[i].setXRange(-self.wanted_size, 0.)
-                self.plots[i].setYRange(f_start, f_stop)
-                self.images[i] =image
-    
-    
-    def apply_actions(self):
-        with self.mutex_action:
-            if self.running():
-                self.global_timer.stop()
-            for action, do_it in self.actions.items():
-                if do_it:
-                    action()
-            for action in self.actions:
-                self.actions[action] = False
-            if self.running():
-                self.global_timer.start()
-    
-    def compute_maps(self):
-        head = int(self.global_poller.pos())
-        for i in range(self.nb_channel):
-            if self.by_channel_params.children()[i]['visible']:
-                if self.local_workers:
-                    self.workers[i].compute_one_map(head)
-                else:
-                    self.workers[i].compute_one_map(head, _sync='off')
-    
-    def on_new_map_local(self, chan):
-        head, wt_map = self.input_maps[chan].recv()
-        self.update_image(chan, head, wt_map)
-    
-    def on_new_map_socket(self, head, wt_map):
-        chan = self.sender().chan
-        self.update_image(chan, head, wt_map)
-
-    def update_image(self, chan, head, wt_map):
-        if self.images[chan] is None: return
-        if self.params['mode']=='scroll':
-            self.images[chan].updateImage(wt_map)
-        elif self.params['mode'] =='scan':
-            ind = (head//self.downsample_factor)%self.plot_length+1
-            wt_map = np.concatenate([wt_map[-ind:, :], wt_map[:-ind, :]], axis=0)
-            self.images[chan].updateImage(wt_map)
-    
-    def clim_zoom(self, factor):
-        for i, p in enumerate(self.by_channel_params.children()):
-            p.param('clim').setValue(p.param('clim').value()*factor)
-        
-    def xsize_zoom(self, xmove):
-        factor = xmove/100.
-        newsize = self.params['xsize']*(factor+1.)
-        limits = self.params.param('xsize').opts['limits']
-        if newsize>limits[0] and newsize<limits[1]:
-            self.params['xsize'] = newsize    
-    
-    def auto_clim(self, identic=True):
-        if identic:
-            all = []
-            for i, p in enumerate(self.by_channel_params.children()):
-                if p.param('visible').value():
-                    all.append(np.max(self.images[i].image))
-            clim = np.max(all)*1.1
-            for i, p in enumerate(self.by_channel_params.children()):
-                if p.param('visible').value():
-                    p.param('clim').setValue(float(clim))
-        else:
-            for i, p in enumerate(self.by_channel_params.children()):
-                if p.param('visible').value():
-                    clim = np.max(self.images[i].image)*1.1
-                    p.param('clim').setValue(float(clim))
-
-register_node_type(QTimeFreq)
-
-
 def generate_wavelet_fourier(len_wavelet, f_start, f_stop, deltafreq, sample_rate, f0, normalisation):
     """
     Compute the wavelet coefficients at all scales and compute its Fourier transform.
@@ -519,3 +301,222 @@ class TimeFreqController(QtGui.QWidget):
         for i, p in enumerate(self.viewer.by_channel_params.children()):
             p.param('clim').setValue(p.param('clim').value()*factor)
 
+
+
+default_params = [
+        {'name': 'xsize', 'type': 'float', 'value': 10., 'step': 0.1, 'limits': (.1, 60)},
+        {'name': 'nb_column', 'type': 'int', 'value': 1},
+        {'name': 'background_color', 'type': 'color', 'value': 'k'},
+        #~ {'name': 'colormap', 'type': 'list', 'value': 'hot', 'values' : ['hot', 'coolwarm', 'ice', 'grays', ] },
+        {'name': 'colormap', 'type': 'list', 'value': 'hot', 'values': list(vispy.color.get_colormaps().keys())},
+        {'name': 'refresh_interval', 'type': 'int', 'value': 500, 'limits':[5, 1000]},
+        {'name': 'mode', 'type': 'list', 'value': 'scroll', 'values': ['scan', 'scroll']},
+        {'name': 'show_axis', 'type': 'bool', 'value': False},
+        # ~ {'name': 'display_labels', 'type': 'bool', 'value': False }, #TODO when title
+        {'name': 'timefreq', 'type': 'group', 'children': [
+                        {'name': 'f_start', 'type': 'float', 'value': 3., 'step': 1.},
+                        {'name': 'f_stop', 'type': 'float', 'value': 90., 'step': 1.},
+                        {'name': 'deltafreq', 'type': 'float', 'value': 3., 'step': 1., 'limits': [0.1, 1.e6]},
+                        {'name': 'f0', 'type': 'float', 'value': 2.5, 'step': 0.1},
+                        {'name': 'normalisation', 'type': 'float', 'value': 0., 'step': 0.1},]}
+    ]
+
+default_by_channel_params = [ 
+                {'name': 'visible', 'type': 'bool', 'value': True},
+                {'name': 'clim', 'type': 'float', 'value': 1.},
+            ]
+
+
+class QTimeFreq(BaseSpectro):
+    """
+    Class for visualizing the frequency spectrogram with a Morlet continuous
+    wavelet transform.
+    
+    This allows better visualization than the standard FFT spectrogram because
+    it provides better temporal resolution for high-frequency signals without
+    sacrificing frequency resolution for low-frequency signals.
+    See https://en.wikipedia.org/wiki/Morlet_wavelet
+    
+    This class internally uses one TimeFreqWorker per channel, which allows
+    multiple signals to be transformed in parallel.
+        
+    The node operates in one of 2 modes:
+    
+    * Each TimeFreqWorker lives in the same QApplication as the QTimeFreq node
+      (nodegroup_friends=None).
+    * Each TimeFreqWorker is spawned in another NodeGroup to distribute the
+      load (nodegroup_friends=[some_list_of_nodegroup]).
+    
+    This viewer needs manual tuning for performance: small refresh_interval, 
+    high number of freqs, hight f_stop, and high xsize can all lead to heavy
+    CPU load.
+    
+    This node requires its input stream to use:
+    
+    * ``transfermode==sharedarray``
+    * ``timeaxis==1``
+    
+    If the input stream does not meet these requirements, then a StreamConverter
+    will be created to proxy the input.
+    
+    QTimeFreq can be configured on the fly by changing QTimeFreq.params and 
+    QTimeFreq.by_channel_params. By default, double-clicking on the viewer 
+    will open a GUI dialog for these parameters.
+    
+    
+    Usage::
+    
+        viewer = QTimeFreq()
+        viewer.configure(with_user_dialog=True, nodegroup_friends=None)
+        viewer.input.connect(somedevice.output)
+        viewer.initialize()
+        viewer.show()
+        viewer.start()
+        
+        viewer.params['nb_column'] = 4
+        viewer.params['refresh_interval'] = 1000
+    
+    """
+    
+    _input_specs = {'signal': dict(streamtype='signals', shape=(-1), )}
+    
+    _default_params = default_params
+    _default_by_channel_params = default_by_channel_params
+
+    _worker_cls = TimeFreqWorker
+    _controller_cls = TimeFreqController
+    
+    def __init__(self, **kargs):
+        BaseSpectro.__init__(self, **kargs)
+
+    def _configure(self,max_xsize=60., **kargs):
+        BaseSpectro._configure(self,**kargs)
+        self.max_xsize = max_xsize
+    
+    def initialize_freq_repr(self):
+        tfr_params = self.params.param('timefreq')
+        
+        # we take sample_rate = f_stop*4 or (original sample_rate)
+        if tfr_params['f_stop']*4 < self.sample_rate:
+            sub_sample_rate = tfr_params['f_stop']*4
+        else:
+            sub_sample_rate = self.sample_rate
+        
+        # this try to find the best size to get a timefreq of 2**N by changing
+        # the sub_sample_rate and the sig_chunk_size
+        self.wanted_size = self.params['xsize']
+        self.len_wavelet = l = int(2**np.ceil(np.log(self.wanted_size*sub_sample_rate)/np.log(2)))
+        self.sig_chunk_size = self.wanted_size*self.sample_rate
+        self.downsample_factor = int(np.ceil(self.sig_chunk_size/l))
+        self.sig_chunk_size = self.downsample_factor*l
+        self.sub_sample_rate = self.sample_rate/self.downsample_factor
+        self.plot_length = int(self.wanted_size*sub_sample_rate)
+        
+        self.wavelet_fourrier = generate_wavelet_fourier(self.len_wavelet, tfr_params['f_start'], tfr_params['f_stop'],
+                            tfr_params['deltafreq'], self.sub_sample_rate, tfr_params['f0'], tfr_params['normalisation'])
+        
+        if self.downsample_factor>1:
+            self.filter_b = scipy.signal.firwin(9, 1. / self.downsample_factor, window='hamming')
+            self.filter_a = np.array([1.])
+        else:
+            self.filter_b = None
+            self.filter_a = None
+        
+        for worker in self.workers:
+            worker.on_fly_change_wavelet(wavelet_fourrier=self.wavelet_fourrier, downsample_factor=self.downsample_factor,
+                        sig_chunk_size=self.sig_chunk_size, plot_length=self.plot_length, filter_a=self.filter_a, filter_b=self.filter_b)
+        
+        for input_map in self.input_maps:
+            input_map.params['shape'] = (self.plot_length, self.wavelet_fourrier.shape[1])
+            input_map.params['sample_rate'] = sub_sample_rate
+    
+    def initialize_plots(self):
+        N = 512
+        cmap = vispy.color.get_colormap(self.params['colormap'])
+        self.lut = (255*cmap.map(np.arange(N)[:,None]/float(N))).astype('uint8')
+        
+        tfr_params = self.params.param('timefreq')
+        for i in range(self.nb_channel):
+            if self.by_channel_params.children()[i]['visible']:
+                for item in self.plots[i].items:
+                    # remove old images
+                    self.plots[i].removeItem(item)
+                
+                clim = self.by_channel_params.children()[i]['clim']
+                f_start, f_stop = tfr_params['f_start'], tfr_params['f_stop']
+                
+                image = pg.ImageItem()
+                image.setImage(np.zeros((self.plot_length,self.wavelet_fourrier.shape[1])), lut=self.lut, levels=[0,clim])
+                self.plots[i].addItem(image)
+                image.setRect(QtCore.QRectF(-self.wanted_size, f_start,self.wanted_size, f_stop-f_start))
+                self.plots[i].setXRange(-self.wanted_size, 0.)
+                self.plots[i].setYRange(f_start, f_stop)
+                self.images[i] =image
+    
+    
+    def apply_actions(self):
+        with self.mutex_action:
+            if self.running():
+                self.global_timer.stop()
+            for action, do_it in self.actions.items():
+                if do_it:
+                    action()
+            for action in self.actions:
+                self.actions[action] = False
+            if self.running():
+                self.global_timer.start()
+    
+    def compute_maps(self):
+        head = int(self.global_poller.pos())
+        for i in range(self.nb_channel):
+            if self.by_channel_params.children()[i]['visible']:
+                if self.local_workers:
+                    self.workers[i].compute_one_map(head)
+                else:
+                    self.workers[i].compute_one_map(head, _sync='off')
+    
+    def on_new_map_local(self, chan):
+        head, wt_map = self.input_maps[chan].recv()
+        self.update_image(chan, head, wt_map)
+    
+    def on_new_map_socket(self, head, wt_map):
+        chan = self.sender().chan
+        self.update_image(chan, head, wt_map)
+
+    def update_image(self, chan, head, wt_map):
+        if self.images[chan] is None: return
+        if self.params['mode']=='scroll':
+            self.images[chan].updateImage(wt_map)
+        elif self.params['mode'] =='scan':
+            ind = (head//self.downsample_factor)%self.plot_length+1
+            wt_map = np.concatenate([wt_map[-ind:, :], wt_map[:-ind, :]], axis=0)
+            self.images[chan].updateImage(wt_map)
+    
+    def clim_zoom(self, factor):
+        for i, p in enumerate(self.by_channel_params.children()):
+            p.param('clim').setValue(p.param('clim').value()*factor)
+        
+    def xsize_zoom(self, xmove):
+        factor = xmove/100.
+        newsize = self.params['xsize']*(factor+1.)
+        limits = self.params.param('xsize').opts['limits']
+        if newsize>limits[0] and newsize<limits[1]:
+            self.params['xsize'] = newsize    
+    
+    def auto_clim(self, identic=True):
+        if identic:
+            all = []
+            for i, p in enumerate(self.by_channel_params.children()):
+                if p.param('visible').value():
+                    all.append(np.max(self.images[i].image))
+            clim = np.max(all)*1.1
+            for i, p in enumerate(self.by_channel_params.children()):
+                if p.param('visible').value():
+                    p.param('clim').setValue(float(clim))
+        else:
+            for i, p in enumerate(self.by_channel_params.children()):
+                if p.param('visible').value():
+                    clim = np.max(self.images[i].image)*1.1
+                    p.param('clim').setValue(float(clim))
+
+register_node_type(QTimeFreq)

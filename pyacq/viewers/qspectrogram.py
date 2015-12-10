@@ -96,10 +96,10 @@ class BaseSpectro(WidgetNode):
             
             # create worker
             if self.local_workers:
-                worker = self.worker_cls()
+                worker = self._worker_cls()
             else:
                 ng = self.nodegroup_friends[i%max(len(self.nodegroup_friends)-1, 1)]
-                worker = ng.create_node('TimeFreqWorker')
+                worker = ng.create_node(self._worker_cls.__name__)
                 worker.ng_proxy = ng
             worker.configure(max_xsize=self.max_xsize, channel=i, local=self.local_workers)
             worker.input.connect(self.conv.output)
@@ -113,7 +113,14 @@ class BaseSpectro(WidgetNode):
             
             # socket stream for maps from worker
             input_map = InputStream()
-            stream_spec = dict(worker.output.params)
+            out_params = worker.output.params
+            if not isinstance(out_params, dict):
+                # worker is remote; request attribute from remote process.
+                out_params = out_params._get_value()
+            else:
+                # copy to prevent modification
+                out_params = dict(out_params)
+            stream_spec = out_params
             input_map.connect(worker.output)
             self.input_maps.append(input_map)
             if self.local_workers:
@@ -148,7 +155,7 @@ class BaseSpectro(WidgetNode):
         self.all_params.sigTreeStateChanged.connect(self.on_param_change)
         
         if self.with_user_dialog:
-            self.params_controller = self.controller_cls(parent=self, viewer=self)
+            self.params_controller = self._controller_cls(parent=self, viewer=self)
             self.params_controller.setWindowFlags(QtCore.Qt.Window)
         else:
             self.params_controller = None
